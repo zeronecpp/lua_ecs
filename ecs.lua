@@ -1,8 +1,7 @@
 ---------------------------------------------------------------------
 -- TODO:
--- 优化remove和add component的效率 in c？
--- 优化寻找chunk，代替现在的字符串拼接逻辑
--- add/rm component时，缓存不被update的entity
+-- remove/add component in c？
+-- better chunk searching
 ---------------------------------------------------------------------
 -- Debug
 local serpent = require "serpent"
