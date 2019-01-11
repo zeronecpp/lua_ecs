@@ -1,7 +1,8 @@
 ---------------------------------------------------------------------
 -- TODO:
--- remove/add component in c？
--- better chunk searching
+-- 优化remove和add component的效率 in c？
+-- 优化寻找chunk，代替现在的字符串拼接逻辑
+-- add/rm component时，缓存不被update的entity
 ---------------------------------------------------------------------
 -- Debug
 local serpent = require "serpent"
@@ -12,12 +13,18 @@ function string_split(str, sep)
     end
     return r
 end
+
 local printTable = function (t)
 	local strList = string_split(serpent.block(t),"\n")
 	for _,v in ipairs(strList) do
 		print (v)
 	end
 end
+
+--config
+
+local fixedTimeStep = 33.3333333333333333333333333333
+
 
 ----------------------------------------------------------------------
 --[[
@@ -28,6 +35,7 @@ end
 	start_world
 ]]--
 ----------------------------------------------------------------------
+local ecsc = require "ecsc"
 local table = table
 local tsort = table.sort
 
@@ -42,27 +50,58 @@ ecs.entities = entities
 local comp_tree = {}
 
 local system_array = {}
+local update_array = {}
+
+setmetatable(update_array, {__mode = "v"})
 
 local notify_map = {}
+
+local tupleTypes = {}
 
 local eventOnAddComponent = "OnAddComponent"
 local eventOnRemoveComponent = "OnRemoveComponent"
 local eventOnNewEntity = "OnNewEntity"
 local eventOnDelEntity = "OnDelEntity"
 
+local function clear_data()
+	entities = {}
+	entity_id = 0
+	ecs.entities = entities
+	comp_tree = {}
+	system_array = {}
+	
+	update_array = {}
+	setmetatable(update_array, {__mode = "v"})
+
+	notify_map = {}
+
+	postUpdateCommandArray = {}
+	notify_list_memoize = {}
+
+	ecsc.dispose()
+end
+
 -----------------------------------------------------------------------
 --- component tree internal functions
 
-local function new_chunk(chunkStr,compTypes)
-	assert(comp_tree[chunkStr] == nil)
+local function new_chunk(chunkCode,compTypes)
+	assert(comp_tree[chunkCode] == nil)
 	
 	local newChunk = {}
 	for _,typeStr in ipairs(compTypes) do
 		newChunk[typeStr] = {}
 	end
-	newChunk._entityIDs = {}
+	newChunk.entityIDs = {}
 	newChunk._compTypes = compTypes
+	newChunk._nextChunks = {}
+
+	notify_map[newChunk] = {}
+
 	return newChunk
+end
+
+local function chunk_tostring(c)
+	return table.concat(c._compTypes)
 end
 
 local function get_upward_chunk_name(t)
@@ -104,41 +143,52 @@ local function update_tree(chunk,types)
 	return findUpChunk
 end
 
-local function create_tree()
-	local chunks = {}
-	for k,v in pairs(comp_tree) do
-		chunks[#chunks+1] = {k,v,#v._compTypes}
-	end
-
-	-- sort high layer to low
-	tsort( chunks, function (a,b)
-		if a[3] > b[3] then
-			return true
+local function create_tuple_chunks()
+	local chunk
+	for _,v in pairs(tupleTypes) do
+		chunk = comp_tree[v.hashCode]
+		if (chunk == nil) then
+			chunk = new_chunk(v.hashCode,v.comps)
+			comp_tree[v.hashCode] = chunk
 		end
-		return false
-	end)
-	
-	for i=1,#chunks do
-		local chunk = chunks[i][2]
-		update_tree(chunk, chunk._compTypes)
 	end
 end
 
 
--- 消息通知和injectdata相反
--- 为向上通知
+local function create_tree()
+	create_tuple_chunks()
+	ecsc.init_tree()
+	local nextList
+	local chunkCt = 0
+	for chunkCode,chunk in pairs(comp_tree) do
+		chunkCt = chunkCt + 1
+		nextList = ecsc.get_next_list(chunkCode)
+		chunk._nextChunks = {}
+		for i,v in ipairs(nextList) do
+			chunk._nextChunks[i] = comp_tree[v]
+		end
+	end
+
+	printTable(comp_tree)
+end
+
 local function update_notify_map()
 	local nextChunk
-	local nextSystemSet
+	local nextChunkSet
 	for chunk,systemSet in pairs(notify_map) do
 		local nextChunkArray = chunk._nextChunks
+		--print ("deal with chunk "..chunk_tostring(chunk))
 		if nextChunkArray then
 			for i=1,#nextChunkArray do
 				nextChunk = nextChunkArray[i]
-				nextSystemSet = notify_map[nextChunk]
-				if nextSystemSet then
-					for system,_ in pairs(systemSet) do
-						nextSystemSet[system] = true
+				--print ("--- next chunk "..chunk_tostring(nextChunk))
+				if notify_map[nextChunk] then 
+					nextSystemSet = notify_map[nextChunk]
+					if nextSystemSet then
+						for sys,_ in pairs(systemSet) do
+							nextSystemSet[sys] = true
+							--print ("update_notify_map nextSystemSet[system]"..sys.name)
+						end
 					end
 				end
 			end
@@ -157,27 +207,31 @@ local function get_notify_list(chunk)
 	local system
 	local notifySet = notify_map[chunk]
 	local ret = {}
-	for iSys = 1,#system_array do
-		system = system_array[iSys]
-		if notifySet[system] then
-			ret[#ret+1] = system
+	if notifySet then
+		for iSys = 1,#system_array do
+			system = system_array[iSys]
+			if notifySet[system] then
+				ret[#ret+1] = system
+			end
 		end
 	end
 	notify_list_memoize[chunk] = ret
 	return ret
 end
 
-
 -- 系统事件按照系统update顺序执行
-local function notify_system(chunk,eventName,ud1,ud2)
+local function notify_system(chunk,eventName,...)
 	local notifyList = get_notify_list(chunk)
 	local system
 	local eventFunc
+	--print ("notify_system "..chunk_tostring(chunk).." "..eventName)
 	for i=1,#notifyList do
 		system = notifyList[i]
+		--print ("---"..system.name)
 		eventFunc = system[eventName]
 		if eventFunc then
-			eventFunc(ud1,ud2)
+			--print ("called function "..eventName)
+			eventFunc(...)
 		end
 	end
 end
@@ -190,12 +244,12 @@ local function init_component_data(eid, e, chunk, keyTable, data)
 	for i=1,#keyTable do
 		key = keyTable[i]
 		compArray = chunk[key]
-		assert(data[key], "data and group not fit")
+		assert(data[key] ~= nil, "data and group not fit : key = "..key)
 		assert(compArray)
 		compArray[#compArray+1] = data[key]
 	end
 
-	local entityArray = chunk._entityIDs
+	local entityArray = chunk.entityIDs
 	entityArray[#entityArray + 1] = eid
 
 	e.chunk = chunk
@@ -204,15 +258,23 @@ end
 
 ----------------------------------------------------------------------------------
 
-function ecs.new_entity(compGroup, data)
+--==============================--
+--desc: create a new entity
+--time:2018-04-16 06:09:40
+--@tupleType: registered tuple
+--@data: all component data
+--@return entity id
+--==============================--
+function ecs.new_entity(tupleType, data)
 	local e = {}
 	entity_id = entity_id + 1
 	entities[entity_id] = e
 
-	local chunk = compGroup.chunk
-	init_component_data(entity_id, e, chunk, compGroup.comps, data)
+	local chunk = comp_tree[tupleType.hashCode]
+	init_component_data(entity_id, e, chunk, tupleType.comps, data)
 	notify_system(chunk,eventOnNewEntity,chunk,e.chunkIndex)
 	
+	print ("entity created "..entity_id)
 	return entity_id
 end
 
@@ -230,7 +292,7 @@ function ecs.delete_entity(eid)
 	local e = assert(entities[eid])
 	local index = e.chunkIndex
 	local chunk = e.chunk
-	local chunkEntities = chunk._entityIDs
+	local chunkEntities = chunk.entityIDs
 	local length = #chunkEntities
 	local compArray
 
@@ -255,71 +317,50 @@ end
 -- for optimizing remove/add behavior
 -- pre register a chunk
 function ecs.register_tuple(comps)
-	tsort(comps)
-	local chunkStr = table.concat(comps)
-	local chunk = comp_tree[chunkStr]
-	if (chunk == nil) then
-		chunk = new_chunk(chunkStr,comps)
-		comp_tree[chunkStr] = chunk
-	end
-
-	local ret = {}
-	ret.chunk = chunk
-	ret.comps = comps
-	
-	return ret
+	local hashCode = ecsc.get_or_create_tuple(comps)
+	local tupleType = {}
+	tupleType.hashCode = hashCode
+	tupleType.comps = comps
+	tupleTypes[hashCode] = tupleType
+	return tupleType
 end
 
--- set a group of components to a entity
--- recommand for initialization a entity
--- like this:
--- ecs.set_components(eid,{
--- 	position = {1,2},
--- 	collision = false,
--- 	test = "whalla"
--- })
-function ecs.set_components(eid, data)
+function ecs.data_accessor(eid)
+	local ret = {}
+	local retmt = {}
+	--TODO: 这个upvalue有可能被长期应用造成内存泄露？
 	local e = assert(entities[eid])
-	if e.chunk ~= nil then
-		print ("should not turn a component to another!")
-		return false
-	end
-
-	local keyTable = {}
-	for k,v in pairs(data) do
-		keyTable[#keyTable+1] = k
-	end
-
-	tsort( keyTable )
-
-	local chunkStr = table.concat(keyTable)
-	local compChunk = comp_tree[chunkStr]
-	if compChunk == nil then
-		--no need
-		print ("no system for this entity "..chunkStr)
-		return
-	end
-
-	local key = nil
-	local compArray = nil
-	for i=1,#keyTable do
-		key = keyTable[i]
-		compArray = compChunk[key]
-		if compArray == nil then
-			print ("that's impossible")
-			compChunk[key] = {}
-			compArray = compChunk[key]
+	retmt.__index = function (t,k)
+		local chunk = assert(e.chunk)
+		local arr = chunk[k]
+		if arr == nil then
+			return nil
+		else
+			return arr[e.chunkIndex]
 		end
-		compArray[#compArray+1] = data[key]
 	end
 
-	local entityArray = compChunk._entityIDs
-	entityArray[#entityArray + 1] = eid
+	return setmetatable(ret,retmt)
+end
 
-	e.chunk = compChunk
-	e.chunkIndex = #entityArray
+-- Athena Exclamation
+-- Do no use this all the time
+function ecs.get_component_data(eid, compName)
+	local e = assert(entities[eid])
+	local chunk = assert(e.chunk)
 
-	return compChunk
+	local arr = chunk[compName]
+	if arr == nil then
+		return nil
+	else
+		return arr[e.chunkIndex]
+	end
+end
+
+function ecs.set_component_data(eid, compName, data)
+	local e = assert(entities[eid])
+	local compArray = assert(e.chunk[compName])
+	compArray[e.chunkIndex] = data
 end
 
 -- add a component to entity
@@ -327,13 +368,14 @@ function ecs.add_component(eid, cType, data)
 	local e = assert(entities[eid])
 
 	if e.chunk == nil then
-		assert (false,"Awful Design!!! You should not empty a exist entity and add data in it again!")
+		assert (false,"Awful Design!!! You should not empty a existed entity and add data in it again!")
 		local initData = {}
 		initData[cType] = data
 		local chunk = comp_tree[cType]
 		local keyTable = {cType}
+		local hashCode = ecsc.get_or_create_tuple(keyTable)
 		if chunk == nil then
-			chunk = new_chunk(cType,keyTable)
+			chunk = new_chunk(hashCode,keyTable)
 		end
 		init_component_data(eid,e,chunk,keyTable,initData)
 		return
@@ -362,26 +404,24 @@ function ecs.add_component(eid, cType, data)
 	tsort(newCompTypes)
 	local newChunkStr = table.concat(newCompTypes)
 
-	dstChunk = comp_tree[newChunkStr]
+	local dstChunk = comp_tree[newChunkStr]
 
 	-- if there's upward chunks update tree
 	if dstChunk == nil then
-		local newChunk = new_chunk(newChunkStr,newCompTypes)
+		local hashCode = ecsc.get_or_create_tuple(keyTable)
+		local newChunk = new_chunk(hashCode,newCompTypes)
 		local found = update_tree(newChunk,newCompTypes)
-		if found then
-			comp_tree[newChunkStr] = newChunk
-			dstChunk = newChunk
-		else
-			-- no system inject the data
-			-- TODO 缓存起来，免得被gc
-		end
+
+		comp_tree[newChunkStr] = newChunk
+		dstChunk = newChunk
+		update_notify_map()
 	end
 
 	-- same code in remove_component
 	if dstChunk then
 		-- insert
-		local srcEntityIDs = chunk._entityIDs
-		local dstEntityIDs = dstChunk._entityIDs
+		local srcEntityIDs = chunk.entityIDs
+		local dstEntityIDs = dstChunk.entityIDs
 		local key = nil
 		local dstCompArray = nil
 		local srcCompArray = nil
@@ -407,7 +447,7 @@ function ecs.add_component(eid, cType, data)
 		e.chunk = dstChunk
 		e.chunkIndex = dstLen+1
 
-		notify_system(dstChunk, eventOnAddComponent, dstChunk, dstLen+1)
+		notify_system(dstChunk, eventOnAddComponent, cType,dstChunk, dstLen+1)
 	end
 end
 
@@ -438,7 +478,7 @@ function ecs.remove_component(eid, cType)
 	tsort(newCompTypes)
 	local newChunkStr = table.concat(newCompTypes)
 
-	dstChunk = comp_tree[newChunkStr]
+	local dstChunk = comp_tree[newChunkStr]
 
 	-- if there's upward chunks update tree
 	if dstChunk == nil then
@@ -455,8 +495,8 @@ function ecs.remove_component(eid, cType)
 
 	if dstChunk then
 		-- insert
-		local srcEntityIDs = chunk._entityIDs
-		local dstEntityIDs = dstChunk._entityIDs
+		local srcEntityIDs = chunk.entityIDs
+		local dstEntityIDs = dstChunk.entityIDs
 		local key = nil
 		local dstCompArray = nil
 		local srcCompArray = nil
@@ -491,7 +531,7 @@ local function new_iterator(chunk)
 	local iter_mt = {}
 
 	iter.data = chunk
-	iter.len = #chunk._entityIDs
+	iter.len = #chunk.entityIDs
 	iter.index = 0
 
 	function iter.iter_next(t)
@@ -499,8 +539,8 @@ local function new_iterator(chunk)
 		if index == 0 then
 			t.index = t.index + 1
 			t.data = chunk
-			t.entityArray = chunk._entityIDs
-			t.len = #chunk._entityIDs
+			t.entityArray = chunk.entityIDs
+			t.len = #chunk.entityIDs
 			return true
 		else
 			if chunk._nextChunks then
@@ -508,8 +548,8 @@ local function new_iterator(chunk)
 				if data then
 					t.index = t.index + 1
 					t.data = data
-					t.entityArray = data._entityIDs
-					t.len = #data._entityIDs
+					t.entityArray = data.entityIDs
+					t.len = #data.entityIDs
 					return true
 				end
 				return false
@@ -523,8 +563,8 @@ local function new_iterator(chunk)
 		if index == 0 then
 			t.index = t.index + 1
 			t.data = chunk
-			t.entityArray = chunk._entityIDs
-			t.len = #chunk._entityIDs
+			t.entityArray = chunk.entityIDs
+			t.len = #chunk.entityIDs
 			return true
 		end
 		return false
@@ -535,6 +575,7 @@ end
 
 -- start to iterator data
 function ecs.iterator(data)
+	assert (data)
 	local iter = data.iter
 	iter.index = 0
 	if data._chunk._nextChunks then
@@ -548,16 +589,14 @@ end
 -- called in system code
 -- suggest use as a upvalue in system code
 function ecs.inject_data(t)
-	tsort(t)
-	local ret = {}
-	local chunkStr = table.concat(t)
-	local chunk = comp_tree[chunkStr]
-
+	local hashCode = ecsc.get_or_create_tuple(t)
+	local chunk = comp_tree[hashCode]
 	if (chunk == nil) then
-		chunk = new_chunk(chunkStr,t)
-		comp_tree[chunkStr] = chunk
+		chunk = new_chunk(hashCode,t)
+		comp_tree[hashCode] = chunk
 	end
 	
+	local ret = {}
 	ret._chunk = chunk
 	ret.iter = new_iterator(chunk)
 
@@ -569,29 +608,108 @@ function ecs.register_notify(system, systemData)
 	notify_map[chunk] = {}
 	notify_map[chunk][system] = true
 	-- insert leading chunks after tree created
+	--print ("register_notify  "..system.name.." "..chunk_tostring(chunk))
 end
 
 function ecs.register_system()
 	local newSystem = {}
 	system_array[#system_array+1] = newSystem
+
 	return newSystem
 end
 
-function ecs.new_world()
+--------------------------------------------------------------------------
+-- Post Update Commands
+--------------------------------------------------------------------------
+local postUpdateCommandArray = {}
 
+local post_commands = {}
+
+
+local function add_post_command(type,content)
+	table.insert(postUpdateCommandArray, {type = type, content = content})
 end
+
+function post_commands.add_component(eid,cType,data)
+	add_post_command("AddComponent",{eid,cType,data})
+end
+
+function post_commands.remove_component(eid,cType)
+	add_post_command("RemoveComponent",{eid,cType})
+end
+
+function post_commands.new_entity(tuple,data)
+	add_post_command("NewEntity",{tuple,data})
+end
+
+function post_commands.delete_enitity(eid)
+	add_post_command("DelEntity",{eid})
+end
+
+ecs.post_commands = post_commands
+
+local function execute_all_commands()
+	local content
+
+	local i = 1
+	local cmd = postUpdateCommandArray[i]
+	while cmd do
+		content = cmd.content
+		
+		if cmd.type == "AddComponent" then
+			ecs.add_component(content[1], content[2], content[3])
+		elseif cmd.type == "RemoveComponent" then
+			ecs.remove_component(content[1], content[2])
+		elseif cmd.type == "NewEntity" then
+			ecs.new_entity(content[1], content[2])
+		elseif cmd.type == "DelEntity" then
+			ecs.delete_entity(content[1])
+		end
+
+		i = i + 1
+		cmd = postUpdateCommandArray[i]
+	end
+
+	if i > 1 then
+		postUpdateCommandArray = {}
+	end
+end
+
+local timeAccumulator = 0
 
 function ecs.start_world()
 	create_tree()
+	
 	update_notify_map()
+
+	local sys
+	for i=1,#system_array do
+		sys = system_array[i]
+		if sys.update then
+			update_array[#update_array+1] = sys.update
+		end
+	end
+
+	LuaCollision:StartCollisionSystem()
+
+	timeAccumulator = 0
 end
 
 function ecs.update_world(dt)
-	
+	local sys
+	timeAccumulator = timeAccumulator + dt
+	while timeAccumulator >= fixedTimeStep do
+		for i=1,#update_array do
+			update_array[i](fixedTimeStep)
+		end
+		execute_all_commands()
+		timeAccumulator = timeAccumulator - fixedTimeStep
+	end
 end
 
 function ecs.delete_world()
-
+	LuaCollision:StopCollisionSystem()
+	clear_data()
 end
 
 return ecs
